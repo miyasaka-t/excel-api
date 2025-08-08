@@ -1,80 +1,50 @@
-import os
-import tempfile
-import re
-from flask import Flask, request, jsonify
-from openpyxl import load_workbook
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+import pandas as pd
+from typing import Optional, List
 
-app = Flask(__name__)
+app = FastAPI(title="Excel→TSV API", version="1.0.0")
 
-def clean_cell_text(s: str) -> str:
-    if s is None:
-        return ""
-    # 文字列化
-    t = str(s)
-    # Excel由来のリテラル改行トークンを本当の改行に
-    t = t.replace("_x000D_", "\n")
-    # CRLF/CR を LF に正規化
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    # タブは可視的に潰す（TSVに影響しないよう空白へ）
-    t = t.replace("\t", " ")
-    # 連続空白の軽減（全角空白も1個に圧縮）
-    t = re.sub(r"[ \u3000]+", " ", t)
-    # 行頭末の空白を削る & 空行の連続を1つに
-    t = "\n".join([line.strip() for line in t.split("\n")])
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+def df_to_tsv(df: pd.DataFrame) -> str:
+    # すべて文字列化・NaN除去
+    df = df.astype(str).fillna("")
+    # セル内タブ/改行をTSV安全に
+    df = df.applymap(lambda x: x.replace("\t", " ").replace("\r\n", "\n").replace("\r", "\n"))
+    # TSV出力
+    return df.to_csv(sep="\t", index=False, header=True, line_terminator="\n")
 
-@app.route("/")
-def home():
-    return "Flask Excel API is running!"
-
-@app.route("/health")
-def health():
-    return "ok", 200
-
-@app.route("/extract", methods=["POST"])
-def extract():
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "missing 'file' form field"}), 400
-
-    suffix = ".xlsx"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
-
+@app.post("/extract", response_class=PlainTextResponse)
+async def extract_tsv(
+    file: UploadFile = File(..., description="Excelファイル（.xlsx, .xls）"),
+    sheet: Optional[str] = Query(None, description="読み込むシート名。未指定なら全シート"),
+    include_sheet_headers: bool = Query(True, description="複数シート結合時、シート見出し行を付けるか"),
+) -> PlainTextResponse:
     try:
-        wb = load_workbook(tmp_path, data_only=True)
-        ws = wb.active
+        content_type = (file.content_type or "").lower()
+        if not (file.filename.endswith((".xlsx", ".xls")) or "excel" in content_type):
+            raise HTTPException(400, "Excelファイル（.xlsx/.xls）をアップロードしてください。")
 
-        lines = []
-        for row in ws.iter_rows():
-            row_vals = [clean_cell_text(cell.value) for cell in row]
-            # すべて空ならスキップ
-            if any(v.strip() for v in row_vals):
-                lines.append("\t".join(row_vals))
+        # ファイルを直接読み込む（メモリ節約のためUploadFile.fileを渡す）
+        if sheet:
+            # 特定シートのみ
+            df = pd.read_excel(file.file, sheet_name=sheet, dtype=str, engine=None)
+            tsv = df_to_tsv(df)
+            return PlainTextResponse(tsv, media_type="text/plain; charset=utf-8")
 
-        text = "\n".join(lines)
+        # 全シート
+        file.file.seek(0)
+        xls = pd.ExcelFile(file.file, engine=None)
+        parts: List[str] = []
+        for name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=name, dtype=str)
+            if include_sheet_headers:
+                parts.append(f"# sheet: {name}")
+            parts.append(df_to_tsv(df).rstrip("\n"))
+        tsv_all = "\n".join(parts) + "\n"
+        return PlainTextResponse(tsv_all, media_type="text/plain; charset=utf-8")
 
-        # 連続する同一行を間引く
-        deduped = []
-        prev = None
-        for line in text.split("\n"):
-            if line != prev:
-                deduped.append(line)
-            prev = line
-        text = "\n".join(deduped)
-
-        return jsonify({
-            "sheet": ws.title,
-            "text": text
-        })
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    except ValueError as e:
+        # pandasがシート名を見つけられない等
+        raise HTTPException(400, f"読み込みエラー: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"サーバーエラー: {e}")
