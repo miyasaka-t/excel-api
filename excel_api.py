@@ -1,118 +1,49 @@
-import io
+# app.py
 import os
-import json
-from datetime import datetime, date
-from typing import Any
-
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, jsonify, Response
 from openpyxl import load_workbook
 
 app = Flask(__name__)
 
-def to_str(v: Any) -> str:
-    """TSV安全化して文字列化（タブ/改行はスペースに）"""
+# ここだけ変えれば上限を調整できる
+MAX_ROWS = 50
+MAX_COLS = 20
+
+def to_str(v):
     if v is None:
         return ""
-    if isinstance(v, (datetime, date)):
-        return v.isoformat(sep=" ")
     s = str(v)
+    # タブ/改行を潰して行崩れ・肥大化防止
     return s.replace("\t", " ").replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-
-def sheet_to_grid(ws):
-    """マージを展開した値で 2D グリッドを作る"""
-    max_r = ws.max_row or 1
-    max_c = ws.max_column or 1
-
-    # まずは素の値を格納
-    grid = [[None for _ in range(max_c)] for _ in range(max_r)]
-    for r in range(1, max_r + 1):
-        for c in range(1, max_c + 1):
-            cell = ws.cell(row=r, column=c)
-            grid[r-1][c-1] = cell.value
-
-    # マージセルを値で埋める（元のシートは変更しない）
-    for mr in ws.merged_cells.ranges:
-        v = ws.cell(row=mr.min_row, column=mr.min_col).value
-        for r in range(mr.min_row, mr.max_row + 1):
-            for c in range(mr.min_col, mr.max_col + 1):
-                grid[r-1][c-1] = v
-
-    return grid
-
-def grid_to_tsv(grid):
-    lines = []
-    for row in grid:
-        lines.append("\t".join(to_str(v) for v in row))
-    return "\n".join(lines)
-
-def grid_to_json(grid):
-    # 行配列の配列（プレーン）で返す
-    return [[to_str(v) for v in row] for row in grid]
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "message": "excel-api is up", "endpoints": ["/extract"]})
+    return jsonify({"ok": True, "message": "excel-api (simple)", "endpoint": "/extract"})
 
 @app.route("/extract", methods=["POST"])
 def extract():
     """
-    フォーム: file=@xxx.xlsx
-    任意: sheet=シート名 or 0始まり/1始まりどちらでも通す
-    任意: format=tsv|json (デフォルト tsv)
+    使い方: curl -X POST https://<your-app>.onrender.com/extract -F "file=@C:/path/to/file.xlsx"
+    返却: 先頭 50行×20列 の TSV（固定）
     """
-    if "file" not in request.files:
+    f = request.files.get("file")
+    if not f:
         return jsonify({"error": "file is required (multipart/form-data)"}), 400
 
-    f = request.files["file"]
-    data = f.read()
-    if not data:
-        return jsonify({"error": "empty file"}), 400
-
-    # シート選択
-    sheet_req = request.form.get("sheet")
-    fmt = (request.form.get("format") or "tsv").lower()
-
     try:
-        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
+        # read_only=True で軽量に読む / data_only=True で数式は値に
+        wb = load_workbook(f, data_only=True, read_only=True)
     except Exception as e:
         return jsonify({"error": f"failed to read workbook: {e}"}), 400
 
-    # sheet の解決
-    ws = None
-    if sheet_req:
-        # index でも名前でもOK
-        try:
-            # 数値っぽければ index として試す（0/1始まりどっちでも）
-            idx = int(sheet_req)
-            if idx < 0:
-                # 0始まり負数は無効
-                raise ValueError
-            if idx < len(wb.sheetnames):
-                ws = wb[wb.sheetnames[idx]]  # 0始まりとして解釈
-            else:
-                # 1始まりとして再解釈
-                if 1 <= idx <= len(wb.sheetnames):
-                    ws = wb[wb.sheetnames[idx - 1]]
-        except ValueError:
-            # 文字列名として解決
-            if sheet_req in wb.sheetnames:
-                ws = wb[sheet_req]
-    if ws is None:
-        # 指定なし or 解決失敗 → 最初のシート
-        ws = wb[wb.sheetnames[0]]
+    ws = wb.active  # 最初のシートだけ
+    lines = []
 
-    grid = sheet_to_grid(ws)
+    # 先頭 50x20 だけを values_only で取得（マージ展開しない）
+    for row in ws.iter_rows(min_row=1, max_row=MAX_ROWS, min_col=1, max_col=MAX_COLS, values_only=True):
+        lines.append("\t".join(to_str(v) for v in row))
 
-    if fmt == "json":
-        payload = {
-            "sheet": ws.title,
-            "rows": grid_to_json(grid),
-        }
-        return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json; charset=utf-8")
-
-    # 既定は TSV
-    tsv = grid_to_tsv(grid)
-    # 文字化け回避のため UTF-8 + BOM をつけることもあるが、ここは素のUTF-8で返す
+    tsv = "\n".join(lines)
     return Response(tsv, mimetype="text/plain; charset=utf-8")
 
 if __name__ == "__main__":
