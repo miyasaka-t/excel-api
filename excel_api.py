@@ -1,29 +1,24 @@
+import os
 from flask import Flask, request, jsonify
-from openpyxl import load_workbook
-import tempfile
+import openpyxl
 
 app = Flask(__name__)
 
-@app.route('/extract', methods=['POST'])
+@app.route("/")
+def home():
+    return "Flask Excel API is running!"
+
+# 実際のAPI処理の例
+@app.route("/extract", methods=["POST"])
 def extract():
-    file = request.files.get('file')
-    if not file:
-        return jsonify({"error": "ファイルが見つかりません"}), 400
+    file = request.files["file"]
+    wb = openpyxl.load_workbook(file)
+    ws = wb.active
+    data = {}
+    for row in ws.iter_rows(values_only=True):
+        data[row[0]] = row[1]
+    return jsonify(data)
 
-    # 一時ファイルとして保存
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        file.save(tmp.name)
-        wb = load_workbook(tmp.name, data_only=True)
-        ws = wb.active
-
-        result = []
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value is not None:
-                    result.append(f"({cell.row},{cell.column}): \"{str(cell.value)}\"")
-
-    return jsonify({"text": "\n".join(result)})
-
-if __name__ == '__main__':
-    print("✅ Flask API starting...")
-    app.run(debug=True, port=5000)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))  # Render用PORT取得
+    app.run(host="0.0.0.0", port=port, debug=True)
