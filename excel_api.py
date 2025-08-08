@@ -1,30 +1,35 @@
-# app.py
 import os
 from flask import Flask, request, jsonify, Response
 from openpyxl import load_workbook
 
 app = Flask(__name__)
 
-# ざっくり上限（必要なら増やす）
 MAX_ROWS = 200
 MAX_COLS = 50
-MAX_NONEMPTY = 2000  # 返す非空セルの最大数（安全弁）
+MAX_NONEMPTY = 2000  # 安全弁
 
 def to_str(v):
     if v is None:
         return ""
     s = str(v)
-    return s.replace("\t", " ").replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    return (
+        s.replace("_x000D_", " ")  # Excel改行トークン除去
+         .replace("\t", " ")
+         .replace("\r\n", " ")
+         .replace("\n", " ")
+         .replace("\r", " ")
+         .strip()
+    )
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "message": "excel-api (sparse non-empty)", "endpoint": "/extract"})
+    return jsonify({"ok": True, "message": "excel-api (sparse non-empty, BOM)", "endpoint": "/extract"})
 
 @app.route("/extract", methods=["POST"])
 def extract():
     """
-    返却: 非空セルだけを 'A1<TAB>値' 形式で1行ずつ。
-    空セルは出さないので“横に同じ文字が伸びる”現象は起きません。
+    非空セルだけ 'A1<TAB>値' 形式で返す。
+    UTF-8 BOM付きなのでExcelやメモ帳で文字化けしない。
     """
     f = request.files.get("file")
     if not f:
@@ -35,7 +40,7 @@ def extract():
     except Exception as e:
         return jsonify({"error": f"failed to read workbook: {e}"}), 400
 
-    ws = wb.active  # 最初のシート
+    ws = wb.active
     lines = []
     count = 0
 
@@ -55,7 +60,13 @@ def extract():
         if count >= MAX_NONEMPTY:
             break
 
-    return Response("\n".join(lines), mimetype="text/plain; charset=utf-8")
+    # UTF-8 BOM を先頭に付与
+    bom_tsv = "\ufeff" + "\n".join(lines)
+    return Response(
+        bom_tsv,
+        mimetype="text/tab-separated-values; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="extract.tsv"'}
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
